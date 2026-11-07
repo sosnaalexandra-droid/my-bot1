@@ -49,3 +49,10 @@
 - Новая команда /notes. System prompt: бизнес-ассистент, отвечает на украинском. Модель claude-sonnet-5-5.
 - requirements.txt дополнен: httpx, beautifulsoup4.
 - ОСТАЁТСЯ (серверный шаг, выдан пользователю): переключить mybot.service с /root/bot.py на /root/agent_bot.py (sed в юните), daemon-reload, reset --hard, pip install, restart. В логах должно быть "Agent bot started with tools".
+
+## 2026-11-07 — Добавлены напоминания в agent_bot.py
+- Новые инструменты: set_reminder / list_reminders / delete_reminder. Команда /reminders.
+- Доставка: JobQueue проверяет каждую минуту папку reminders/<uid>.json и шлёт «⏰ Нагадування: ...» в нужное время. Переживает перезапуск (хранится в файлах).
+- requirements.txt: python-telegram-bot[job-queue] (нужен APScheduler). reminders/ в .gitignore.
+- Время задаётся абсолютно 'ГГГГ-ММ-ДД ЧЧ:ММ' по Киеву; Claude сам считает относительное время через get_datetime.
+- Подтверждено: agent_bot.py уже работает на сервере (пользователь прислал /help агента). Для напоминаний нужен серверный шаг: pip install (job-queue) + restart.
