@@ -42,3 +42,10 @@
 - Первая sync-команда (авто-поиск bot.py через find) обновила не ту копию. Исправлено командой, нацеленной прямо на /root: подключили /root к репо my-bot1, git reset --hard origin/main, restart.
 - РЕЗУЛЬТАТ: бот в Telegram отвечает новым приветствием «SMM-ассистент для Instagram». Автодеплой теперь тянет из my-bot1/main.
 - ВАЖНО на будущее: правильная папка бота на сервере = /root (не /root/my-bot). Автодеплой делает cd /root && git pull.
+
+## 2026-11-07 — Апгрейд до агента с инструментами (agent_bot.py)
+- Создан agent_bot.py с Claude Tool Use. Инструменты: calculate (безопасный ast, без eval), get_datetime (Киев), save_note/list_notes/delete_note, read_url (httpx+bs4). Обработка фото через Claude Vision.
+- Нотатки: папка notes/, файл на user_id (notes/<uid>.json). notes/ добавлена в .gitignore, чтобы деплой её не перезаписывал.
+- Новая команда /notes. System prompt: бизнес-ассистент, отвечает на украинском. Модель claude-sonnet-5-5.
+- requirements.txt дополнен: httpx, beautifulsoup4.
+- ОСТАЁТСЯ (серверный шаг, выдан пользователю): переключить mybot.service с /root/bot.py на /root/agent_bot.py (sed в юните), daemon-reload, reset --hard, pip install, restart. В логах должно быть "Agent bot started with tools".
