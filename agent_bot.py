@@ -51,6 +51,16 @@ REM_DIR = os.path.join(HERE, "reminders")
 os.makedirs(NOTES_DIR, exist_ok=True)
 os.makedirs(REM_DIR, exist_ok=True)
 
+# --- Instagram Graph API (Meta). Значення беруться з .env на сервері ---
+IG_VERSION = os.environ.get("IG_API_VERSION", "v21.0")
+IG_TOKEN = os.environ.get("INSTAGRAM_TOKEN", "")
+IG_USER_ID = os.environ.get("IG_USER_ID", "")
+IG_BASE = f"https://graph.facebook.com/{IG_VERSION}"
+IG_NOT_CONFIGURED = (
+    "Instagram ще не підключений. У файлі .env на сервері потрібні INSTAGRAM_TOKEN "
+    "та IG_USER_ID (їх видає Meta for Developers). Попроси користувача налаштувати підключення."
+)
+
 SYSTEM_PROMPT = (
     "Ти — бізнес-асистент у Telegram. Допомагаєш підприємцю зі стратегією, "
     "задачами, фінансами, текстами та щоденною рутиною. Відповідай українською, "
@@ -64,7 +74,14 @@ SYSTEM_PROMPT = (
     "Важливо про нагадування: час завжди передавай в абсолютному форматі "
     "'РРРР-ММ-ДД ГГ:ХХ' за київським часом. Якщо користувач каже відносний час "
     "('завтра о 9', 'через годину') — спершу виклич get_datetime, порахуй точний "
-    "момент і лише тоді виклич set_reminder."
+    "момент і лише тоді виклич set_reminder.\n\n"
+    "Коли просять проаналізувати Instagram — працюй як топовий SMM-стратег. "
+    "Збери дані через instagram_profile, instagram_recent_media та instagram_insights "
+    "(для чужих акаунтів — instagram_competitor). Порахуй ER "
+    "(середні (лайки+коментарі)/підписники × 100%), оціни контент-мікс і типи постів, "
+    "частоту й регулярність, частку Reels. Дай конкретний аудит: 3 сильні сторони, "
+    "3 слабкі, і покроковий план зростання на 2 тижні з ідеями Reels та рубриками. "
+    "Спирайся лише на реальні цифри з інструментів; якщо даних бракує — скажи, яких саме."
 )
 
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -212,6 +229,80 @@ def tool_read_url(url: str) -> str:
         return f"Не вдалося прочитати сторінку: {e}"
 
 
+# --- Instagram Graph API ---
+def _ig_ready() -> bool:
+    return bool(IG_TOKEN and IG_USER_ID)
+
+
+def _ig_get(path: str, params: dict) -> dict:
+    q = dict(params or {})
+    q["access_token"] = IG_TOKEN
+    r = httpx.get(f"{IG_BASE}/{path}", params=q, timeout=25)
+    data = r.json()
+    if r.status_code >= 400 or (isinstance(data, dict) and "error" in data):
+        msg = data.get("error", {}).get("message", r.text) if isinstance(data, dict) else r.text
+        raise RuntimeError(msg)
+    return data
+
+
+def _trim(s: str, limit: int = 3500) -> str:
+    return s if len(s) <= limit else s[:limit] + " …(обрізано)"
+
+
+def tool_ig_profile() -> str:
+    if not _ig_ready():
+        return IG_NOT_CONFIGURED
+    try:
+        d = _ig_get(IG_USER_ID, {"fields": "username,name,biography,followers_count,follows_count,media_count"})
+        return _trim(json.dumps(d, ensure_ascii=False))
+    except Exception as e:
+        return f"Помилка Instagram API (profile): {e}"
+
+
+def tool_ig_recent_media(limit=10) -> str:
+    if not _ig_ready():
+        return IG_NOT_CONFIGURED
+    try:
+        n = max(1, min(int(limit or 10), 25))
+        d = _ig_get(f"{IG_USER_ID}/media", {
+            "fields": "id,caption,media_type,media_product_type,timestamp,like_count,comments_count,permalink",
+            "limit": n,
+        })
+        items = d.get("data", [])
+        for it in items:
+            if it.get("caption"):
+                it["caption"] = it["caption"][:300]
+        return _trim(json.dumps(items, ensure_ascii=False))
+    except Exception as e:
+        return f"Помилка Instagram API (media): {e}"
+
+
+def tool_ig_insights() -> str:
+    if not _ig_ready():
+        return IG_NOT_CONFIGURED
+    try:
+        d = _ig_get(f"{IG_USER_ID}/insights", {"metric": "reach", "period": "days_28", "metric_type": "total_value"})
+        return _trim(json.dumps(d.get("data", d), ensure_ascii=False))
+    except Exception as e:
+        return f"Помилка Instagram API (insights): {e}"
+
+
+def tool_ig_competitor(username: str) -> str:
+    if not _ig_ready():
+        return IG_NOT_CONFIGURED
+    uname = re.sub(r"[^A-Za-z0-9._]", "", str(username or ""))
+    if not uname:
+        return "Вкажи коректний username (латиниця, крапки, підкреслення)."
+    try:
+        fields = (f"business_discovery.username({uname})"
+                  "{username,followers_count,media_count,"
+                  "media.limit(10){like_count,comments_count,caption,media_type,timestamp}}")
+        d = _ig_get(IG_USER_ID, {"fields": fields})
+        return _trim(json.dumps(d.get("business_discovery", d), ensure_ascii=False))
+    except Exception as e:
+        return f"Помилка Instagram API (competitor): {e}"
+
+
 TOOLS = [
     {"name": "calculate",
      "description": "Точно обчислює арифметичний вираз (+,-,*,/,**,%,//).",
@@ -253,6 +344,21 @@ TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"url": {"type": "string"}},
                       "required": ["url"]}},
+    {"name": "instagram_profile",
+     "description": "Профіль підключеного Instagram-акаунта: username, біо, підписники, кількість постів.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "instagram_recent_media",
+     "description": "Останні пости акаунта з лайками, коментарями, типом і підписом.",
+     "input_schema": {"type": "object",
+                      "properties": {"limit": {"type": "integer", "description": "Скільки постів (1..25)"}}}},
+    {"name": "instagram_insights",
+     "description": "Інсайти акаунта за 28 днів (охоплення/reach).",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "instagram_competitor",
+     "description": "Публічні метрики ІНШОГО бізнес-акаунта за username (підписники, пости, останні публікації).",
+     "input_schema": {"type": "object",
+                      "properties": {"username": {"type": "string"}},
+                      "required": ["username"]}},
 ]
 
 
@@ -277,6 +383,14 @@ def execute_tool(name: str, tool_input: dict, uid: int, chat_id: int) -> str:
             return tool_delete_reminder(uid, tool_input.get("number"))
         if name == "read_url":
             return tool_read_url(str(tool_input.get("url", "")))
+        if name == "instagram_profile":
+            return tool_ig_profile()
+        if name == "instagram_recent_media":
+            return tool_ig_recent_media(tool_input.get("limit", 10))
+        if name == "instagram_insights":
+            return tool_ig_insights()
+        if name == "instagram_competitor":
+            return tool_ig_competitor(tool_input.get("username", ""))
         return f"Невідомий інструмент: {name}"
     except Exception as e:
         log.exception("Tool %s failed", name)
@@ -355,12 +469,14 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• ⏰ Нагадування: «нагадай завтра о 9 про ...», перегляд — /reminders\n"
         "• 🕒 Казати дату й час\n"
         "• 🔗 Читати сторінку за посиланням\n"
-        "• 🖼 Розбирати надіслані фото\n\n"
+        "• 🖼 Розбирати надіслані фото\n"
+        "• 📊 Аналізувати Instagram як топ-SMM — /ig\n\n"
         "Команди:\n"
         "/start — привітання\n"
         "/help — ця довідка\n"
         "/notes — показати нотатки\n"
         "/reminders — показати нагадування\n"
+        "/ig — SMM-аудит Instagram-акаунта\n"
         "/reset — очистити поточний діалог"
     )
 
@@ -376,6 +492,28 @@ async def notes_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def reminders_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏰ Твої нагадування:\n" + tool_list_reminders(update.effective_user.id))
+
+
+async def ig_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
+    await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+    prompt = (
+        "Проведи повний SMM-аудит мого Instagram-акаунта: візьми профіль, останні пости "
+        "та інсайти через інструменти, порахуй ER, і дай конкретні рекомендації та план "
+        "зростання на 2 тижні."
+    )
+    working = history.get(uid, []) + [{"role": "user", "content": prompt}]
+    try:
+        answer = await run_agent(working, uid, chat_id)
+        hist = history.setdefault(uid, [])
+        hist.append({"role": "user", "content": prompt})
+        hist.append({"role": "assistant", "content": answer})
+        history[uid] = hist[-HISTORY_LIMIT:]
+        await update.message.reply_text(answer)
+    except Exception:
+        log.exception("ig_cmd error")
+        await update.message.reply_text("Не вдалося зробити аудит. Перевір, чи підключений Instagram.")
 
 
 async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -427,6 +565,7 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("notes", notes_cmd))
     app.add_handler(CommandHandler("reminders", reminders_cmd))
+    app.add_handler(CommandHandler("ig", ig_cmd))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.PHOTO, photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
