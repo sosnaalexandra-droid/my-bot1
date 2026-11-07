@@ -56,3 +56,10 @@
 - requirements.txt: python-telegram-bot[job-queue] (нужен APScheduler). reminders/ в .gitignore.
 - Время задаётся абсолютно 'ГГГГ-ММ-ДД ЧЧ:ММ' по Киеву; Claude сам считает относительное время через get_datetime.
 - Подтверждено: agent_bot.py уже работает на сервере (пользователь прислал /help агента). Для напоминаний нужен серверный шаг: pip install (job-queue) + restart.
+
+## 2026-11-07 — Instagram Graph API интеграция
+- Пользователь выбрал официальный Meta API (НЕ скрапинг — он против правил Instagram).
+- Добавлены инструменты: instagram_profile, instagram_recent_media, instagram_insights, instagram_competitor(username, через business_discovery). Команда /ig = полный SMM-аудит.
+- System prompt: при анализе IG работает как топ-SMM — считает ER, контент-микс, частоту, долю Reels, даёт 3+3 и план на 2 недели.
+- Secrets в .env на сервере (НЕ в git): INSTAGRAM_TOKEN, IG_USER_ID, опц. IG_API_VERSION (default v21.0). Код читает из окружения; если не заданы — инструменты возвращают "не подключён".
+- ОСТАЁТСЯ: пользователь настраивает Meta app (IG Business/Creator + страница FB), получает IG_USER_ID и долгоживущий токен, вписывает в /root/.env, затем deploy+restart. Токен живёт ~60 дней (потом обновлять).
