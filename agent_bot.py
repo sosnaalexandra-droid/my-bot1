@@ -10,6 +10,7 @@ import os
 import re
 import ast
 import json
+import time
 import base64
 import asyncio
 import logging
@@ -76,7 +77,10 @@ SYSTEM_PROMPT = (
     "('завтра о 9', 'через годину') — спершу виклич get_datetime, порахуй точний "
     "момент і лише тоді виклич set_reminder.\n\n"
     "Коли просять проаналізувати Instagram — працюй як топовий SMM-стратег. "
-    "Збери дані через instagram_profile, instagram_recent_media та instagram_insights "
+    "Акаунтів може бути декілька: спершу виклич instagram_accounts. Якщо користувач "
+    "не вказав конкретний — покажи список і спитай, який аналізувати (або, якщо він "
+    "просить усі, пройдись по кожному). Далі збери дані через instagram_profile, "
+    "instagram_recent_media та instagram_insights, передаючи потрібний account "
     "(для чужих акаунтів — instagram_competitor). Порахуй ER "
     "(середні (лайки+коментарі)/підписники × 100%), оціни контент-мікс і типи постів, "
     "частоту й регулярність, частку Reels. Дай конкретний аудит: 3 сильні сторони, "
@@ -229,9 +233,9 @@ def tool_read_url(url: str) -> str:
         return f"Не вдалося прочитати сторінку: {e}"
 
 
-# --- Instagram Graph API ---
+# --- Instagram Graph API (підтримка кількох акаунтів) ---
 def _ig_ready() -> bool:
-    return bool(IG_TOKEN and IG_USER_ID)
+    return bool(IG_TOKEN)
 
 
 def _ig_get(path: str, params: dict) -> dict:
@@ -249,22 +253,74 @@ def _trim(s: str, limit: int = 3500) -> str:
     return s if len(s) <= limit else s[:limit] + " …(обрізано)"
 
 
-def tool_ig_profile() -> str:
+_ig_accounts_cache = {"ts": 0.0, "data": []}
+
+
+def _ig_accounts() -> list:
+    """Усі Instagram-бізнес-акаунти, доступні за токеном (через сторінки FB). Кеш 5 хв."""
+    if _ig_accounts_cache["data"] and time.time() - _ig_accounts_cache["ts"] < 300:
+        return _ig_accounts_cache["data"]
+    d = _ig_get("me/accounts", {"fields": "name,instagram_business_account{id,username}", "limit": 50})
+    accts = []
+    for p in d.get("data", []):
+        iba = p.get("instagram_business_account")
+        if iba and iba.get("id"):
+            accts.append({"page": p.get("name"), "ig_id": iba["id"], "username": iba.get("username")})
+    if not accts and IG_USER_ID:  # запасний варіант — один явно заданий акаунт
+        accts.append({"page": None, "ig_id": IG_USER_ID, "username": None})
+    _ig_accounts_cache.update(ts=time.time(), data=accts)
+    return accts
+
+
+def _resolve_ig_id(selector) -> str:
+    accts = _ig_accounts()
+    if not accts:
+        raise RuntimeError("За цим токеном не знайдено жодного Instagram-бізнес-акаунта.")
+    if not selector:
+        if len(accts) > 1:
+            names = ", ".join(a.get("username") or a.get("page") or a["ig_id"] for a in accts)
+            raise RuntimeError(f"Акаунтів декілька: {names}. Уточни, який саме.")
+        return accts[0]["ig_id"]
+    s = str(selector).strip().lstrip("@").lower()
+    for a in accts:
+        if (a.get("username") or "").lower() == s or (a.get("page") or "").lower() == s:
+            return a["ig_id"]
+    if s.isdigit() and 1 <= int(s) <= len(accts):
+        return accts[int(s) - 1]["ig_id"]
+    names = ", ".join(a.get("username") or a.get("page") or a["ig_id"] for a in accts)
+    raise RuntimeError(f"Акаунт '{selector}' не знайдено. Доступні: {names}")
+
+
+def tool_ig_accounts() -> str:
     if not _ig_ready():
         return IG_NOT_CONFIGURED
     try:
-        d = _ig_get(IG_USER_ID, {"fields": "username,name,biography,followers_count,follows_count,media_count"})
+        accts = _ig_accounts()
+        if not accts:
+            return "За цим токеном не знайдено Instagram-бізнес-акаунтів."
+        return _trim(json.dumps(accts, ensure_ascii=False))
+    except Exception as e:
+        return f"Помилка Instagram API (accounts): {e}"
+
+
+def tool_ig_profile(account=None) -> str:
+    if not _ig_ready():
+        return IG_NOT_CONFIGURED
+    try:
+        ig_id = _resolve_ig_id(account)
+        d = _ig_get(ig_id, {"fields": "username,name,biography,followers_count,follows_count,media_count"})
         return _trim(json.dumps(d, ensure_ascii=False))
     except Exception as e:
         return f"Помилка Instagram API (profile): {e}"
 
 
-def tool_ig_recent_media(limit=10) -> str:
+def tool_ig_recent_media(account=None, limit=10) -> str:
     if not _ig_ready():
         return IG_NOT_CONFIGURED
     try:
+        ig_id = _resolve_ig_id(account)
         n = max(1, min(int(limit or 10), 25))
-        d = _ig_get(f"{IG_USER_ID}/media", {
+        d = _ig_get(f"{ig_id}/media", {
             "fields": "id,caption,media_type,media_product_type,timestamp,like_count,comments_count,permalink",
             "limit": n,
         })
@@ -277,11 +333,12 @@ def tool_ig_recent_media(limit=10) -> str:
         return f"Помилка Instagram API (media): {e}"
 
 
-def tool_ig_insights() -> str:
+def tool_ig_insights(account=None) -> str:
     if not _ig_ready():
         return IG_NOT_CONFIGURED
     try:
-        d = _ig_get(f"{IG_USER_ID}/insights", {"metric": "reach", "period": "days_28", "metric_type": "total_value"})
+        ig_id = _resolve_ig_id(account)
+        d = _ig_get(f"{ig_id}/insights", {"metric": "reach", "period": "days_28", "metric_type": "total_value"})
         return _trim(json.dumps(d.get("data", d), ensure_ascii=False))
     except Exception as e:
         return f"Помилка Instagram API (insights): {e}"
@@ -294,10 +351,14 @@ def tool_ig_competitor(username: str) -> str:
     if not uname:
         return "Вкажи коректний username (латиниця, крапки, підкреслення)."
     try:
+        accts = _ig_accounts()
+        if not accts:
+            raise RuntimeError("Немає доступного Instagram-акаунта для запиту.")
+        node_id = accts[0]["ig_id"]
         fields = (f"business_discovery.username({uname})"
                   "{username,followers_count,media_count,"
                   "media.limit(10){like_count,comments_count,caption,media_type,timestamp}}")
-        d = _ig_get(IG_USER_ID, {"fields": fields})
+        d = _ig_get(node_id, {"fields": fields})
         return _trim(json.dumps(d.get("business_discovery", d), ensure_ascii=False))
     except Exception as e:
         return f"Помилка Instagram API (competitor): {e}"
@@ -344,16 +405,22 @@ TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"url": {"type": "string"}},
                       "required": ["url"]}},
-    {"name": "instagram_profile",
-     "description": "Профіль підключеного Instagram-акаунта: username, біо, підписники, кількість постів.",
+    {"name": "instagram_accounts",
+     "description": "Список усіх підключених Instagram-акаунтів (username та сторінка). Виклич першим, якщо акаунтів декілька.",
      "input_schema": {"type": "object", "properties": {}}},
+    {"name": "instagram_profile",
+     "description": "Профіль акаунта: username, біо, підписники, кількість постів. Якщо акаунтів кілька — вкажи account (username).",
+     "input_schema": {"type": "object",
+                      "properties": {"account": {"type": "string", "description": "username або назва акаунта"}}}},
     {"name": "instagram_recent_media",
      "description": "Останні пости акаунта з лайками, коментарями, типом і підписом.",
      "input_schema": {"type": "object",
-                      "properties": {"limit": {"type": "integer", "description": "Скільки постів (1..25)"}}}},
+                      "properties": {"account": {"type": "string", "description": "username акаунта (якщо їх кілька)"},
+                                     "limit": {"type": "integer", "description": "Скільки постів (1..25)"}}}},
     {"name": "instagram_insights",
-     "description": "Інсайти акаунта за 28 днів (охоплення/reach).",
-     "input_schema": {"type": "object", "properties": {}}},
+     "description": "Інсайти акаунта за 28 днів (охоплення/reach). Вкажи account, якщо акаунтів кілька.",
+     "input_schema": {"type": "object",
+                      "properties": {"account": {"type": "string", "description": "username акаунта"}}}},
     {"name": "instagram_competitor",
      "description": "Публічні метрики ІНШОГО бізнес-акаунта за username (підписники, пости, останні публікації).",
      "input_schema": {"type": "object",
@@ -383,12 +450,14 @@ def execute_tool(name: str, tool_input: dict, uid: int, chat_id: int) -> str:
             return tool_delete_reminder(uid, tool_input.get("number"))
         if name == "read_url":
             return tool_read_url(str(tool_input.get("url", "")))
+        if name == "instagram_accounts":
+            return tool_ig_accounts()
         if name == "instagram_profile":
-            return tool_ig_profile()
+            return tool_ig_profile(tool_input.get("account"))
         if name == "instagram_recent_media":
-            return tool_ig_recent_media(tool_input.get("limit", 10))
+            return tool_ig_recent_media(tool_input.get("account"), tool_input.get("limit", 10))
         if name == "instagram_insights":
-            return tool_ig_insights()
+            return tool_ig_insights(tool_input.get("account"))
         if name == "instagram_competitor":
             return tool_ig_competitor(tool_input.get("username", ""))
         return f"Невідомий інструмент: {name}"
@@ -470,7 +539,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• 🕒 Казати дату й час\n"
         "• 🔗 Читати сторінку за посиланням\n"
         "• 🖼 Розбирати надіслані фото\n"
-        "• 📊 Аналізувати Instagram як топ-SMM — /ig\n\n"
+        "• 📊 Аналізувати Instagram як топ-SMM (кілька акаунтів) — /ig або /ig username\n\n"
         "Команди:\n"
         "/start — привітання\n"
         "/help — ця довідка\n"
@@ -498,8 +567,11 @@ async def ig_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     chat_id = update.effective_chat.id
     await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+    arg = " ".join(ctx.args).strip() if getattr(ctx, "args", None) else ""
+    target = f"акаунта {arg}" if arg else ("акаунта (якщо їх кілька — спершу покажи список "
+                                           "через instagram_accounts і спитай, який саме)")
     prompt = (
-        "Проведи повний SMM-аудит мого Instagram-акаунта: візьми профіль, останні пости "
+        f"Проведи повний SMM-аудит Instagram-{target}: візьми профіль, останні пости "
         "та інсайти через інструменти, порахуй ER, і дай конкретні рекомендації та план "
         "зростання на 2 тижні."
     )
