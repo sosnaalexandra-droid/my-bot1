@@ -1,8 +1,10 @@
 """Telegram-агент на Claude з інструментами (Tool Use).
 
-Інструменти: calculate, get_datetime, save_note / list_notes / delete_note, read_url.
+Інструменти: calculate, get_datetime, save_note / list_notes / delete_note,
+read_url, set_reminder / list_reminders / delete_reminder.
 Також: обробка фото через Claude Vision.
-Нотатки зберігаються у папці notes/, окремий файл на кожного user_id.
+Нотатки й нагадування зберігаються у папках notes/ та reminders/ (окремий файл на user_id).
+Нагадування надсилаються автоматично через JobQueue (перевірка щохвилини).
 """
 import os
 import re
@@ -38,13 +40,16 @@ log = logging.getLogger(__name__)
 # --- Налаштування ---
 MODEL = "claude-sonnet-5-5"
 MAX_TOKENS = 1500
-HISTORY_LIMIT = 20          # скільки повідомлень діалогу пам'ятати
-MAX_TOOL_STEPS = 6          # запобіжник від зациклення інструментів
+HISTORY_LIMIT = 20
+MAX_TOOL_STEPS = 6
 TZ = ZoneInfo("Europe/Kyiv")
+WHEN_FMT = "%Y-%m-%d %H:%M"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NOTES_DIR = os.path.join(HERE, "notes")
+REM_DIR = os.path.join(HERE, "reminders")
 os.makedirs(NOTES_DIR, exist_ok=True)
+os.makedirs(REM_DIR, exist_ok=True)
 
 SYSTEM_PROMPT = (
     "Ти — бізнес-асистент у Telegram. Допомагаєш підприємцю зі стратегією, "
@@ -54,13 +59,33 @@ SYSTEM_PROMPT = (
     "— calculate: точні обчислення;\n"
     "— get_datetime: поточна дата і час (Київ);\n"
     "— save_note / list_notes / delete_note: нотатки користувача;\n"
-    "— read_url: прочитати вміст веб-сторінки за посиланням.\n"
-    "Коли користувач просить щось запам'ятати — збережи нотатку. "
-    "Коли потрібні актуальні дані зі сторінки — прочитай її через read_url."
+    "— set_reminder / list_reminders / delete_reminder: нагадування;\n"
+    "— read_url: прочитати вміст веб-сторінки за посиланням.\n\n"
+    "Важливо про нагадування: час завжди передавай в абсолютному форматі "
+    "'РРРР-ММ-ДД ГГ:ХХ' за київським часом. Якщо користувач каже відносний час "
+    "('завтра о 9', 'через годину') — спершу виклич get_datetime, порахуй точний "
+    "момент і лише тоді виклич set_reminder."
 )
 
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 history: dict[int, list[dict]] = {}
+
+
+# ===================== Допоміжне: сховище JSON =====================
+
+def _load_json(path: str) -> list:
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+
+def _save_json(path: str, data: list):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 # ===================== Інструменти =====================
@@ -93,52 +118,80 @@ def tool_calculate(expression: str) -> str:
 def tool_get_datetime() -> str:
     now = datetime.now(TZ)
     days = ["понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя"]
-    return now.strftime("%Y-%m-%d %H:%M") + f" ({days[now.weekday()]}, Київ)"
+    return now.strftime(WHEN_FMT) + f" ({days[now.weekday()]}, Київ)"
 
 
+# --- Нотатки ---
 def _notes_path(uid: int) -> str:
     return os.path.join(NOTES_DIR, f"{uid}.json")
 
 
-def _load_notes(uid: int) -> list:
-    path = _notes_path(uid)
-    if os.path.exists(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
-
-
-def _save_notes(uid: int, notes: list):
-    with open(_notes_path(uid), "w", encoding="utf-8") as f:
-        json.dump(notes, f, ensure_ascii=False, indent=2)
-
-
 def tool_save_note(uid: int, text: str) -> str:
-    notes = _load_notes(uid)
-    notes.append({"ts": datetime.now(TZ).strftime("%Y-%m-%d %H:%M"), "text": text})
-    _save_notes(uid, notes)
+    notes = _load_json(_notes_path(uid))
+    notes.append({"ts": datetime.now(TZ).strftime(WHEN_FMT), "text": text})
+    _save_json(_notes_path(uid), notes)
     return f"Нотатку збережено (всього: {len(notes)})."
 
 
 def tool_list_notes(uid: int) -> str:
-    notes = _load_notes(uid)
+    notes = _load_json(_notes_path(uid))
     if not notes:
         return "Нотаток поки немає."
     return "\n".join(f"{i}. [{n['ts']}] {n['text']}" for i, n in enumerate(notes, 1))
 
 
-def tool_delete_note(uid: int, number: int) -> str:
-    notes = _load_notes(uid)
+def tool_delete_note(uid: int, number) -> str:
+    notes = _load_json(_notes_path(uid))
     if not notes:
         return "Нотаток немає."
     if not isinstance(number, int) or number < 1 or number > len(notes):
         return f"Невірний номер. Доступно 1..{len(notes)}."
     removed = notes.pop(number - 1)
-    _save_notes(uid, notes)
+    _save_json(_notes_path(uid), notes)
     return f"Видалено нотатку {number}: {removed['text']}"
+
+
+# --- Нагадування ---
+def _rem_path(uid: int) -> str:
+    return os.path.join(REM_DIR, f"{uid}.json")
+
+
+def _parse_when(s: str):
+    return datetime.strptime(s, WHEN_FMT).replace(tzinfo=TZ)
+
+
+def tool_set_reminder(uid: int, chat_id: int, when: str, text: str) -> str:
+    try:
+        dt = _parse_when(when)
+    except Exception:
+        return "Невірний формат часу. Потрібен 'РРРР-ММ-ДД ГГ:ХХ'."
+    if dt <= datetime.now(TZ):
+        return "Цей час уже минув. Вкажи майбутній момент."
+    rems = _load_json(_rem_path(uid))
+    rems.append({
+        "id": datetime.now(TZ).strftime("%Y%m%d%H%M%S%f"),
+        "when": when, "text": text, "chat_id": chat_id,
+    })
+    _save_json(_rem_path(uid), rems)
+    return f"Нагадування поставлено на {when}: {text}"
+
+
+def tool_list_reminders(uid: int) -> str:
+    rems = sorted(_load_json(_rem_path(uid)), key=lambda r: r["when"])
+    if not rems:
+        return "Активних нагадувань немає."
+    return "\n".join(f"{i}. [{r['when']}] {r['text']}" for i, r in enumerate(rems, 1))
+
+
+def tool_delete_reminder(uid: int, number) -> str:
+    rems = sorted(_load_json(_rem_path(uid)), key=lambda r: r["when"])
+    if not rems:
+        return "Нагадувань немає."
+    if not isinstance(number, int) or number < 1 or number > len(rems):
+        return f"Невірний номер. Доступно 1..{len(rems)}."
+    removed = rems.pop(number - 1)
+    _save_json(_rem_path(uid), rems)
+    return f"Видалено нагадування: {removed['text']}"
 
 
 def tool_read_url(url: str) -> str:
@@ -160,56 +213,50 @@ def tool_read_url(url: str) -> str:
 
 
 TOOLS = [
-    {
-        "name": "calculate",
-        "description": "Точно обчислює арифметичний вираз (+,-,*,/,**,%,//).",
-        "input_schema": {
-            "type": "object",
-            "properties": {"expression": {"type": "string", "description": "Напр. '1250*0.2+300'"}},
-            "required": ["expression"],
-        },
-    },
-    {
-        "name": "get_datetime",
-        "description": "Повертає поточну дату, час і день тижня (часовий пояс Київ).",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "save_note",
-        "description": "Зберігає нотатку користувача.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"text": {"type": "string", "description": "Текст нотатки"}},
-            "required": ["text"],
-        },
-    },
-    {
-        "name": "list_notes",
-        "description": "Повертає всі нотатки користувача з номерами.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "delete_note",
-        "description": "Видаляє нотатку за її номером зі списку.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"number": {"type": "integer", "description": "Номер нотатки"}},
-            "required": ["number"],
-        },
-    },
-    {
-        "name": "read_url",
-        "description": "Завантажує веб-сторінку і повертає її текст (до 3000 символів).",
-        "input_schema": {
-            "type": "object",
-            "properties": {"url": {"type": "string", "description": "Посилання на сторінку"}},
-            "required": ["url"],
-        },
-    },
+    {"name": "calculate",
+     "description": "Точно обчислює арифметичний вираз (+,-,*,/,**,%,//).",
+     "input_schema": {"type": "object",
+                      "properties": {"expression": {"type": "string", "description": "Напр. '1250*0.2+300'"}},
+                      "required": ["expression"]}},
+    {"name": "get_datetime",
+     "description": "Повертає поточну дату, час і день тижня (часовий пояс Київ).",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "save_note",
+     "description": "Зберігає нотатку користувача.",
+     "input_schema": {"type": "object",
+                      "properties": {"text": {"type": "string"}},
+                      "required": ["text"]}},
+    {"name": "list_notes",
+     "description": "Повертає всі нотатки користувача з номерами.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "delete_note",
+     "description": "Видаляє нотатку за її номером.",
+     "input_schema": {"type": "object",
+                      "properties": {"number": {"type": "integer"}},
+                      "required": ["number"]}},
+    {"name": "set_reminder",
+     "description": "Ставить нагадування: бот сам надішле повідомлення у вказаний час.",
+     "input_schema": {"type": "object",
+                      "properties": {"when": {"type": "string", "description": "Час 'РРРР-ММ-ДД ГГ:ХХ' (Київ)"},
+                                     "text": {"type": "string", "description": "Про що нагадати"}},
+                      "required": ["when", "text"]}},
+    {"name": "list_reminders",
+     "description": "Показує активні нагадування користувача з номерами.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "delete_reminder",
+     "description": "Видаляє нагадування за його номером.",
+     "input_schema": {"type": "object",
+                      "properties": {"number": {"type": "integer"}},
+                      "required": ["number"]}},
+    {"name": "read_url",
+     "description": "Завантажує веб-сторінку і повертає її текст (до 3000 символів).",
+     "input_schema": {"type": "object",
+                      "properties": {"url": {"type": "string"}},
+                      "required": ["url"]}},
 ]
 
 
-def execute_tool(name: str, tool_input: dict, uid: int) -> str:
+def execute_tool(name: str, tool_input: dict, uid: int, chat_id: int) -> str:
     try:
         if name == "calculate":
             return tool_calculate(str(tool_input.get("expression", "")))
@@ -221,6 +268,13 @@ def execute_tool(name: str, tool_input: dict, uid: int) -> str:
             return tool_list_notes(uid)
         if name == "delete_note":
             return tool_delete_note(uid, tool_input.get("number"))
+        if name == "set_reminder":
+            return tool_set_reminder(uid, chat_id, str(tool_input.get("when", "")),
+                                     str(tool_input.get("text", "")).strip())
+        if name == "list_reminders":
+            return tool_list_reminders(uid)
+        if name == "delete_reminder":
+            return tool_delete_reminder(uid, tool_input.get("number"))
         if name == "read_url":
             return tool_read_url(str(tool_input.get("url", "")))
         return f"Невідомий інструмент: {name}"
@@ -231,32 +285,54 @@ def execute_tool(name: str, tool_input: dict, uid: int) -> str:
 
 # ===================== Агентний цикл =====================
 
-def _run_agent_sync(messages: list, uid: int) -> str:
-    """Виконує цикл Tool Use і повертає фінальний текст відповіді."""
+def _run_agent_sync(messages: list, uid: int, chat_id: int) -> str:
     for _ in range(MAX_TOOL_STEPS):
         resp = claude.messages.create(
             model=MODEL, max_tokens=MAX_TOKENS, system=SYSTEM_PROMPT,
             tools=TOOLS, messages=messages,
         )
         if resp.stop_reason != "tool_use":
-            return "".join(b.text for b in resp.content if b.type == "text").strip() \
-                or "Готово."
+            return "".join(b.text for b in resp.content if b.type == "text").strip() or "Готово."
         messages.append({"role": "assistant", "content": resp.content})
-        tool_results = []
+        results = []
         for block in resp.content:
             if block.type == "tool_use":
-                out = execute_tool(block.name, block.input or {}, uid)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": out,
-                })
-        messages.append({"role": "user", "content": tool_results})
+                out = execute_tool(block.name, block.input or {}, uid, chat_id)
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": out})
+        messages.append({"role": "user", "content": results})
     return "Забагато кроків із інструментами, спробуй переформулювати запит."
 
 
-async def run_agent(messages: list, uid: int) -> str:
-    return await asyncio.to_thread(_run_agent_sync, messages, uid)
+async def run_agent(messages: list, uid: int, chat_id: int) -> str:
+    return await asyncio.to_thread(_run_agent_sync, messages, uid, chat_id)
+
+
+# ===================== Перевірка нагадувань =====================
+
+async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(TZ)
+    for fname in os.listdir(REM_DIR):
+        if not fname.endswith(".json"):
+            continue
+        path = os.path.join(REM_DIR, fname)
+        rems = _load_json(path)
+        if not rems:
+            continue
+        due, keep = [], []
+        for r in rems:
+            try:
+                is_due = _parse_when(r["when"]) <= now
+            except Exception:
+                is_due = False  # битий запис — лишаємо, не надсилаємо
+            (due if is_due else keep).append(r)
+        if not due:
+            continue
+        for r in due:
+            try:
+                await context.bot.send_message(chat_id=r["chat_id"], text=f"⏰ Нагадування: {r['text']}")
+            except Exception:
+                log.exception("Не вдалося надіслати нагадування")
+        _save_json(path, keep)
 
 
 # ===================== Хендлери =====================
@@ -264,9 +340,9 @@ async def run_agent(messages: list, uid: int) -> str:
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Вітаю! Я ваш бізнес-асистент з інструментами. 🤖\n"
-        "Вмію: рахувати, зберігати нотатки, підказувати дату й час, читати веб-сторінки "
-        "за посиланням і розбирати надіслані фото.\n\n"
-        "Команди: /help — можливості, /notes — мої нотатки, /reset — очистити діалог."
+        "Вмію: рахувати, зберігати нотатки, ставити нагадування, підказувати дату й час, "
+        "читати веб-сторінки за посиланням і розбирати надіслані фото.\n\n"
+        "Команди: /help — можливості, /notes — нотатки, /reminders — нагадування, /reset — очистити діалог."
     )
 
 
@@ -274,8 +350,9 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Що я вмію:\n"
         "• Відповідати на бізнес-питання, стратегія й тексти\n"
-        "• 🧮 Рахувати (просто попроси порахувати)\n"
+        "• 🧮 Рахувати\n"
         "• 📝 Зберігати нотатки: «запам'ятай ...», перегляд — /notes\n"
+        "• ⏰ Нагадування: «нагадай завтра о 9 про ...», перегляд — /reminders\n"
         "• 🕒 Казати дату й час\n"
         "• 🔗 Читати сторінку за посиланням\n"
         "• 🖼 Розбирати надіслані фото\n\n"
@@ -283,6 +360,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/start — привітання\n"
         "/help — ця довідка\n"
         "/notes — показати нотатки\n"
+        "/reminders — показати нагадування\n"
         "/reset — очистити поточний діалог"
     )
 
@@ -296,13 +374,18 @@ async def notes_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📝 Твої нотатки:\n" + tool_list_notes(update.effective_user.id))
 
 
+async def reminders_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏰ Твої нагадування:\n" + tool_list_reminders(update.effective_user.id))
+
+
 async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    chat_id = update.effective_chat.id
     user_text = update.message.text
-    await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
     working = history.get(uid, []) + [{"role": "user", "content": user_text}]
     try:
-        answer = await run_agent(working, uid)
+        answer = await run_agent(working, uid, chat_id)
         hist = history.setdefault(uid, [])
         hist.append({"role": "user", "content": user_text})
         hist.append({"role": "assistant", "content": answer})
@@ -315,8 +398,9 @@ async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    chat_id = update.effective_chat.id
     caption = update.message.caption or "Що на цьому фото? Коротко опиши й підкажи, чим це корисно для бізнесу."
-    await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
         tg_file = await update.message.photo[-1].get_file()
         buf = await tg_file.download_as_bytearray()
@@ -326,7 +410,7 @@ async def photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             {"type": "text", "text": caption},
         ]
         working = history.get(uid, []) + [{"role": "user", "content": content}]
-        answer = await run_agent(working, uid)
+        answer = await run_agent(working, uid, chat_id)
         hist = history.setdefault(uid, [])
         hist.append({"role": "user", "content": f"[фото] {caption}"})
         hist.append({"role": "assistant", "content": answer})
@@ -342,9 +426,12 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("notes", notes_cmd))
+    app.add_handler(CommandHandler("reminders", reminders_cmd))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.PHOTO, photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
+    # Перевіряємо нагадування щохвилини
+    app.job_queue.run_repeating(check_reminders, interval=60, first=10)
     log.info("Agent bot started with tools")
     app.run_polling()
 
