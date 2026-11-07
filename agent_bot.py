@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 
 # --- Налаштування ---
 MODEL = "claude-sonnet-5-5"
-MAX_TOKENS = 1500
+MAX_TOKENS = 2000
 HISTORY_LIMIT = 20
 MAX_TOOL_STEPS = 6
 TZ = ZoneInfo("Europe/Kyiv")
@@ -314,21 +314,26 @@ def tool_ig_profile(account=None) -> str:
         return f"Помилка Instagram API (profile): {e}"
 
 
-def tool_ig_recent_media(account=None, limit=10) -> str:
+def tool_ig_recent_media(account=None, limit=24) -> str:
     if not _ig_ready():
         return IG_NOT_CONFIGURED
     try:
         ig_id = _resolve_ig_id(account)
-        n = max(1, min(int(limit or 10), 25))
+        n = max(1, min(int(limit or 24), 50))
         d = _ig_get(f"{ig_id}/media", {
-            "fields": "id,caption,media_type,media_product_type,timestamp,like_count,comments_count,permalink",
+            "fields": "caption,media_type,media_product_type,timestamp,like_count,comments_count",
             "limit": n,
         })
-        items = d.get("data", [])
-        for it in items:
-            if it.get("caption"):
-                it["caption"] = it["caption"][:300]
-        return _trim(json.dumps(items, ensure_ascii=False))
+        items = []
+        for it in d.get("data", []):
+            items.append({
+                "date": (it.get("timestamp") or "")[:10],
+                "type": it.get("media_product_type") or it.get("media_type"),
+                "likes": it.get("like_count"),
+                "comments": it.get("comments_count"),
+                "caption": (it.get("caption") or "")[:80],
+            })
+        return _trim(json.dumps(items, ensure_ascii=False), 6000)
     except Exception as e:
         return f"Помилка Instagram API (media): {e}"
 
@@ -413,10 +418,10 @@ TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"account": {"type": "string", "description": "username або назва акаунта"}}}},
     {"name": "instagram_recent_media",
-     "description": "Останні пости акаунта з лайками, коментарями, типом і підписом.",
+     "description": "Останні пости акаунта з лайками, коментарями, типом і датою (за замовчуванням 24).",
      "input_schema": {"type": "object",
                       "properties": {"account": {"type": "string", "description": "username акаунта (якщо їх кілька)"},
-                                     "limit": {"type": "integer", "description": "Скільки постів (1..25)"}}}},
+                                     "limit": {"type": "integer", "description": "Скільки постів (1..50), типово 24"}}}},
     {"name": "instagram_insights",
      "description": "Інсайти акаунта за 28 днів (охоплення/reach). Вкажи account, якщо акаунтів кілька.",
      "input_schema": {"type": "object",
