@@ -544,13 +544,17 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• 🕒 Казати дату й час\n"
         "• 🔗 Читати сторінку за посиланням\n"
         "• 🖼 Розбирати надіслані фото\n"
-        "• 📊 Аналізувати Instagram як топ-SMM (кілька акаунтів) — /ig або /ig username\n\n"
+        "• 📊 Аналізувати Instagram як топ-SMM (кілька акаунтів) — /ig або /ig username\n"
+        "• 🎬 Монтажний сценарій Reels — /reels тема\n"
+        "• 🖼 Карусель слайд-за-слайдом — /carousel тема\n\n"
         "Команди:\n"
         "/start — привітання\n"
         "/help — ця довідка\n"
         "/notes — показати нотатки\n"
         "/reminders — показати нагадування\n"
         "/ig — SMM-аудит Instagram-акаунта\n"
+        "/reels тема — сценарій Reels із субтитрами\n"
+        "/carousel тема — карусель по слайдах\n"
         "/reset — очистити поточний діалог"
     )
 
@@ -566,6 +570,58 @@ async def notes_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def reminders_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏰ Твої нагадування:\n" + tool_list_reminders(update.effective_user.id))
+
+
+async def _agent_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str):
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
+    await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+    working = history.get(uid, []) + [{"role": "user", "content": prompt}]
+    try:
+        answer = await run_agent(working, uid, chat_id)
+        hist = history.setdefault(uid, [])
+        hist.append({"role": "user", "content": prompt})
+        hist.append({"role": "assistant", "content": answer})
+        history[uid] = hist[-HISTORY_LIMIT:]
+        await update.message.reply_text(answer)
+    except Exception:
+        log.exception("agent reply error")
+        await update.message.reply_text("Упс, щось пішло не так. Спробуй ще раз.")
+
+
+async def reels_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    topic = " ".join(ctx.args).strip() if getattr(ctx, "args", None) else ""
+    if not topic:
+        await update.message.reply_text(
+            "Напиши тему після команди. Напр.:\n/reels ранкова рутина остеопата")
+        return
+    prompt = (
+        f"Створи професійний монтажний сценарій Reels на тему: «{topic}». "
+        "Пиши так, щоб можна було зібрати відео в CapCut. Структура:\n"
+        "1) ХУК (перші 3 секунди) — 3 варіанти на вибір.\n"
+        "2) РОЗКАДРОВКА по сценах із таймінгом (0–3с, 3–7с, ...): що в кадрі, дія, план.\n"
+        "3) СУБТИТРИ построково — точний текст, який виводити на екран у кожній сцені.\n"
+        "4) ЗВУК/МУЗИКА — настрій, темп, де акценти.\n"
+        "5) ПІДПИС до посту + 5–10 релевантних хештегів.\n"
+        "6) ЗАКЛИК до дії. Коротко й конкретно, без води."
+    )
+    await _agent_reply(update, ctx, prompt)
+
+
+async def carousel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    topic = " ".join(ctx.args).strip() if getattr(ctx, "args", None) else ""
+    if not topic:
+        await update.message.reply_text(
+            "Напиши тему після команди. Напр.:\n/carousel 5 помилок постави")
+        return
+    prompt = (
+        f"Створи карусель для Instagram на тему: «{topic}», слайд за слайдом. Структура:\n"
+        "- СЛАЙД 1 — чіпляючий хук-заголовок.\n"
+        "- СЛАЙДИ 2…N — по одній думці на слайд: текст НА слайді + що зобразити (візуал).\n"
+        "- ОСТАННІЙ СЛАЙД — заклик до дії.\n"
+        "Зроби 6–8 слайдів. Після слайдів дай ПІДПИС до посту + 5–10 хештегів. Коротко, по суті."
+    )
+    await _agent_reply(update, ctx, prompt)
 
 
 async def ig_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -643,6 +699,8 @@ def main():
     app.add_handler(CommandHandler("notes", notes_cmd))
     app.add_handler(CommandHandler("reminders", reminders_cmd))
     app.add_handler(CommandHandler("ig", ig_cmd))
+    app.add_handler(CommandHandler("reels", reels_cmd))
+    app.add_handler(CommandHandler("carousel", carousel_cmd))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.PHOTO, photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
