@@ -546,7 +546,8 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• 🖼 Розбирати надіслані фото\n"
         "• 📊 Аналізувати Instagram як топ-SMM (кілька акаунтів) — /ig або /ig username\n"
         "• 🎬 Монтажний сценарій Reels — /reels тема\n"
-        "• 🖼 Карусель слайд-за-слайдом — /carousel тема\n\n"
+        "• 🖼 Карусель слайд-за-слайдом — /carousel тема\n"
+        "• 🗓 Контент-план на тиждень — /plan акаунт/ніша\n\n"
         "Команди:\n"
         "/start — привітання\n"
         "/help — ця довідка\n"
@@ -555,6 +556,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/ig — SMM-аудит Instagram-акаунта\n"
         "/reels тема — сценарій Reels із субтитрами\n"
         "/carousel тема — карусель по слайдах\n"
+        "/plan акаунт/ніша — контент-план на тиждень\n"
         "/reset — очистити поточний діалог"
     )
 
@@ -620,6 +622,25 @@ async def carousel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "- СЛАЙДИ 2…N — по одній думці на слайд: текст НА слайді + що зобразити (візуал).\n"
         "- ОСТАННІЙ СЛАЙД — заклик до дії.\n"
         "Зроби 6–8 слайдів. Після слайдів дай ПІДПИС до посту + 5–10 хештегів. Коротко, по суті."
+    )
+    await _agent_reply(update, ctx, prompt)
+
+
+async def plan_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    arg = " ".join(ctx.args).strip() if getattr(ctx, "args", None) else ""
+    if not arg:
+        await update.message.reply_text(
+            "Напиши нішу або username підключеного акаунта. Напр.:\n"
+            "/plan sosna_alexandra\n/plan остеопатія для мам")
+        return
+    prompt = (
+        f"Склади контент-план на 7 днів для: «{arg}».\n"
+        "Якщо це username підключеного Instagram-акаунта — спершу візьми його профіль і "
+        "останні пости через інструменти та врахуй, який контент заходить (формати, теми, ER).\n"
+        "Для КОЖНОГО дня (День 1…День 7) вкажи: формат (Reels / Карусель / Stories), тему, "
+        "короткий хук і ціль (охоплення / залучення / продаж). Балансуй формати, роби акцент "
+        "на те, що працює у цієї аудиторії.\n"
+        "У кінці підкажи, для яких днів одразу згенерувати сценарій через /reels чи /carousel."
     )
     await _agent_reply(update, ctx, prompt)
 
@@ -701,6 +722,7 @@ def main():
     app.add_handler(CommandHandler("ig", ig_cmd))
     app.add_handler(CommandHandler("reels", reels_cmd))
     app.add_handler(CommandHandler("carousel", carousel_cmd))
+    app.add_handler(CommandHandler("plan", plan_cmd))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.PHOTO, photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
