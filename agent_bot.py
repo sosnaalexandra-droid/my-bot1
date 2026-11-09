@@ -40,7 +40,8 @@ log = logging.getLogger(__name__)
 
 # --- Налаштування ---
 MODEL = "claude-sonnet-5-5"
-MAX_TOKENS = 2000
+MAX_TOKENS = 4000
+TG_LIMIT = 3900  # запас до ліміту Telegram у 4096 символів
 HISTORY_LIMIT = 20
 MAX_TOOL_STEPS = 6
 TZ = ZoneInfo("Europe/Kyiv")
@@ -525,6 +526,30 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 
 # ===================== Хендлери =====================
 
+async def reply_long(update: Update, text: str):
+    """Надсилає довгу відповідь кількома повідомленнями (ліміт Telegram ~4096)."""
+    text = text or "Готово."
+    if len(text) <= TG_LIMIT:
+        await update.message.reply_text(text)
+        return
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > TG_LIMIT:  # дуже довгий рядок — ріжемо жорстко
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(line[:TG_LIMIT])
+            line = line[TG_LIMIT:]
+        if len(cur) + len(line) + 1 > TG_LIMIT:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        chunks.append(cur)
+    for c in chunks:
+        await update.message.reply_text(c)
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Вітаю! Я ваш бізнес-асистент з інструментами. 🤖\n"
@@ -585,7 +610,7 @@ async def _agent_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: s
         hist.append({"role": "user", "content": prompt})
         hist.append({"role": "assistant", "content": answer})
         history[uid] = hist[-HISTORY_LIMIT:]
-        await update.message.reply_text(answer)
+        await reply_long(update, answer)
     except Exception:
         log.exception("agent reply error")
         await update.message.reply_text("Упс, щось пішло не так. Спробуй ще раз.")
@@ -664,7 +689,7 @@ async def ig_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         hist.append({"role": "user", "content": prompt})
         hist.append({"role": "assistant", "content": answer})
         history[uid] = hist[-HISTORY_LIMIT:]
-        await update.message.reply_text(answer)
+        await reply_long(update, answer)
     except Exception:
         log.exception("ig_cmd error")
         await update.message.reply_text("Не вдалося зробити аудит. Перевір, чи підключений Instagram.")
@@ -682,7 +707,7 @@ async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         hist.append({"role": "user", "content": user_text})
         hist.append({"role": "assistant", "content": answer})
         history[uid] = hist[-HISTORY_LIMIT:]
-        await update.message.reply_text(answer)
+        await reply_long(update, answer)
     except Exception:
         log.exception("chat error")
         await update.message.reply_text("Упс, щось пішло не так. Спробуй ще раз.")
@@ -707,7 +732,7 @@ async def photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         hist.append({"role": "user", "content": f"[фото] {caption}"})
         hist.append({"role": "assistant", "content": answer})
         history[uid] = hist[-HISTORY_LIMIT:]
-        await update.message.reply_text(answer)
+        await reply_long(update, answer)
     except Exception:
         log.exception("photo error")
         await update.message.reply_text("Не вдалося опрацювати фото. Спробуй ще раз.")
