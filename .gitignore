@@ -1,7 +1,8 @@
+*.pyc
 .env
 .relay_state
-venv/
 __pycache__/
-*.pyc
+keywords.json
 notes/
 reminders/
+venv/

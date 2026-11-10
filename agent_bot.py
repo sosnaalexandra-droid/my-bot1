@@ -50,8 +50,12 @@ WHEN_FMT = "%Y-%m-%d %H:%M"
 HERE = os.path.dirname(os.path.abspath(__file__))
 NOTES_DIR = os.path.join(HERE, "notes")
 REM_DIR = os.path.join(HERE, "reminders")
+KW_FILE = os.path.join(HERE, "keywords.json")  # автовідповіді за кодовим словом
 os.makedirs(NOTES_DIR, exist_ok=True)
 os.makedirs(REM_DIR, exist_ok=True)
+
+# ID власника бота (твій Telegram ID) — хто може керувати кодовими словами.
+OWNER_ID = os.environ.get("OWNER_ID", "").strip()
 
 # --- Instagram Graph API (Meta). Значення беруться з .env на сервері ---
 IG_VERSION = os.environ.get("IG_API_VERSION", "v21.0")
@@ -108,6 +112,43 @@ def _load_json(path: str) -> list:
 def _save_json(path: str, data: list):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# --- Автовідповіді за кодовим словом ---
+def _load_kw() -> dict:
+    if os.path.exists(KW_FILE):
+        try:
+            with open(KW_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+                return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_kw(d: dict):
+    with open(KW_FILE, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+
+
+def _is_owner(update: "Update") -> bool:
+    return bool(OWNER_ID) and str(update.effective_user.id) == OWNER_ID
+
+
+def match_keyword(text: str):
+    """Повертає заготовлену відповідь, якщо в тексті є кодове слово, інакше None."""
+    d = _load_kw()
+    if not d or not text:
+        return None
+    low = text.lower()
+    words = set(re.split(r"[^0-9a-zA-Zа-яёіїєґ_]+", low))
+    for kw, resp in d.items():
+        k = kw.lower().strip()
+        if not k:
+            continue
+        if (" " in k and k in low) or (k in words):
+            return resp
+    return None
 
 
 # ===================== Інструменти =====================
@@ -582,6 +623,8 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/reels тема — сценарій Reels із субтитрами\n"
         "/carousel тема — карусель по слайдах\n"
         "/plan акаунт/ніша — контент-план на тиждень\n"
+        "/addkey слово | відповідь — автовідповідь за кодовим словом (для власника)\n"
+        "/keys — список кодових слів, /delkey слово — видалити\n"
         "/reset — очистити поточний діалог"
     )
 
@@ -597,6 +640,60 @@ async def notes_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def reminders_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏰ Твої нагадування:\n" + tool_list_reminders(update.effective_user.id))
+
+
+async def myid_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Твій Telegram ID: {update.effective_user.id}\n"
+        "Щоб керувати кодовими словами, додай на сервері у .env рядок "
+        "OWNER_ID= з цим числом і перезапусти бота.")
+
+
+async def addkey_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not OWNER_ID:
+        await update.message.reply_text(
+            "Спершу признач власника: дізнайся свій ID командою /myid, "
+            "додай OWNER_ID у .env і перезапусти бота.")
+        return
+    if not _is_owner(update):
+        return
+    raw = update.message.text.partition(" ")[2].strip()
+    kw, sep, resp = raw.partition("|")
+    kw, resp = kw.strip().lower(), resp.strip()
+    if not sep or not kw or not resp:
+        await update.message.reply_text(
+            "Формат: /addkey кодове слово | текст відповіді\n"
+            "Напр.: /addkey знижка | Ваш промокод OSTEO10 на першу консультацію 🙂")
+        return
+    d = _load_kw()
+    d[kw] = resp
+    _save_kw(d)
+    await update.message.reply_text(
+        f"Готово. На «{kw}» бот відповідатиме автоматично. Усього правил: {len(d)}")
+
+
+async def keys_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
+    d = _load_kw()
+    if not d:
+        await update.message.reply_text("Кодових слів поки немає. Додай: /addkey слово | відповідь")
+        return
+    lines = [f"• «{k}» → {v[:60]}{'…' if len(v) > 60 else ''}" for k, v in d.items()]
+    await update.message.reply_text("Кодові слова:\n" + "\n".join(lines))
+
+
+async def delkey_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
+    kw = update.message.text.partition(" ")[2].strip().lower()
+    d = _load_kw()
+    if kw in d:
+        del d[kw]
+        _save_kw(d)
+        await update.message.reply_text(f"Видалено: «{kw}»")
+    else:
+        await update.message.reply_text("Немає такого слова. Список: /keys")
 
 
 async def _agent_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str):
@@ -699,6 +796,11 @@ async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     chat_id = update.effective_chat.id
     user_text = update.message.text
+    # Автовідповідь за кодовим словом — має пріоритет над Claude
+    auto = match_keyword(user_text)
+    if auto is not None:
+        await reply_long(update, auto)
+        return
     await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
     working = history.get(uid, []) + [{"role": "user", "content": user_text}]
     try:
@@ -748,6 +850,10 @@ def main():
     app.add_handler(CommandHandler("reels", reels_cmd))
     app.add_handler(CommandHandler("carousel", carousel_cmd))
     app.add_handler(CommandHandler("plan", plan_cmd))
+    app.add_handler(CommandHandler("myid", myid_cmd))
+    app.add_handler(CommandHandler("addkey", addkey_cmd))
+    app.add_handler(CommandHandler("keys", keys_cmd))
+    app.add_handler(CommandHandler("delkey", delkey_cmd))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.PHOTO, photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
