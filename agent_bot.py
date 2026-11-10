@@ -67,6 +67,11 @@ IG_NOT_CONFIGURED = (
     "та IG_USER_ID (їх видає Meta for Developers). Попроси користувача налаштувати підключення."
 )
 
+# Окремий системний токен (SUAT) для автовідповідей на коментарі — не чіпає аудит.
+IG_COMMENT_TOKEN = os.environ.get("IG_COMMENT_TOKEN", "")
+IG_COMMENT_ID = os.environ.get("IG_COMMENT_ID", "")
+IG_COMMENT_USERNAME = os.environ.get("IG_COMMENT_USERNAME", "")
+
 SYSTEM_PROMPT = (
     "Ти — бізнес-асистент у Telegram. Допомагаєш підприємцю зі стратегією, "
     "задачами, фінансами, текстами та щоденною рутиною. Відповідай українською, "
@@ -280,9 +285,9 @@ def _ig_ready() -> bool:
     return bool(IG_TOKEN)
 
 
-def _ig_get(path: str, params: dict) -> dict:
+def _ig_get(path: str, params: dict, token: str = None) -> dict:
     q = dict(params or {})
-    q["access_token"] = IG_TOKEN
+    q["access_token"] = token or IG_TOKEN
     r = httpx.get(f"{IG_BASE}/{path}", params=q, timeout=25)
     data = r.json()
     if r.status_code >= 400 or (isinstance(data, dict) and "error" in data):
@@ -464,8 +469,8 @@ def _ig_save_seen(s):
         json.dump(list(s)[-1000:], f, ensure_ascii=False)
 
 
-def _ig_post(path: str, data: dict = None, json_body: dict = None) -> dict:
-    params = {"access_token": IG_TOKEN}
+def _ig_post(path: str, data: dict = None, json_body: dict = None, token: str = None) -> dict:
+    params = {"access_token": token or IG_TOKEN}
     url = f"{IG_BASE}/{path}"
     if json_body is not None:
         r = httpx.post(url, params=params, json=json_body, timeout=25)
@@ -478,13 +483,13 @@ def _ig_post(path: str, data: dict = None, json_body: dict = None) -> dict:
     return d
 
 
-def _ig_recent_media_ids(ig_id: str, n: int = 3) -> list:
-    d = _ig_get(f"{ig_id}/media", {"fields": "id,timestamp", "limit": n})
+def _ig_recent_media_ids(ig_id: str, n: int = 3, token: str = None) -> list:
+    d = _ig_get(f"{ig_id}/media", {"fields": "id,timestamp", "limit": n}, token=token)
     return [m["id"] for m in d.get("data", [])]
 
 
-def _ig_comments(media_id: str, n: int = 25) -> list:
-    d = _ig_get(f"{media_id}/comments", {"fields": "id,text,username,timestamp", "limit": n})
+def _ig_comments(media_id: str, n: int = 25, token: str = None) -> list:
+    d = _ig_get(f"{media_id}/comments", {"fields": "id,text,username,timestamp", "limit": n}, token=token)
     return d.get("data", [])
 
 
@@ -510,33 +515,27 @@ def _ig_match_rule(text: str, rules: dict):
 
 
 async def check_ig_comments(context: ContextTypes.DEFAULT_TYPE):
-    """Раз на кілька хвилин перевіряє коментарі під останніми постами на кодові слова."""
-    if not _ig_ready():
+    """Раз на кілька хвилин перевіряє коментарі під останніми постами на кодові слова.
+    Використовує окремий системний токен (SUAT) і фіксований ID акаунта з .env."""
+    if not IG_COMMENT_TOKEN or not IG_COMMENT_ID:
         return
     rules = _ig_load_rules()
     cfg = _ig_load_cfg()
-    watch = (cfg.get("watch") or "").strip()
-    if not rules or not watch:
+    if not rules or not cfg.get("watch"):
         return
     since = float(cfg.get("since", 0) or 0)
-    try:
-        accts = _ig_accounts()
-    except Exception:
-        return
-    target = next((a for a in accts if (a.get("username") or "").lower() == watch.lower()), None)
-    if not target:
-        return
-    ig_id = target["ig_id"]
+    ig_id = IG_COMMENT_ID
+    tok = IG_COMMENT_TOKEN
     seen = _ig_load_seen()
     changed = False
     try:
-        media_ids = _ig_recent_media_ids(ig_id, 3)
+        media_ids = _ig_recent_media_ids(ig_id, 3, token=tok)
     except Exception:
         log.exception("IG media list failed")
         return
     for mid in media_ids:
         try:
-            comments = _ig_comments(mid, 25)
+            comments = _ig_comments(mid, 25, token=tok)
         except Exception:
             continue
         for c in comments:
@@ -555,12 +554,12 @@ async def check_ig_comments(context: ContextTypes.DEFAULT_TYPE):
                 try:
                     _ig_post(f"{ig_id}/messages",
                              json_body={"recipient": {"comment_id": cid},
-                                        "message": {"text": dm}})
+                                        "message": {"text": dm}}, token=tok)
                 except Exception as e:
                     log.warning("IG DM failed: %s", e)
             if reply:
                 try:
-                    _ig_post(f"{cid}/replies", data={"message": reply})
+                    _ig_post(f"{cid}/replies", data={"message": reply}, token=tok)
                 except Exception as e:
                     log.warning("IG public reply failed: %s", e)
     if changed:
@@ -860,21 +859,19 @@ async def igwatch_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if not _is_owner(update):
         return
-    uname = " ".join(ctx.args).strip().lstrip("@").lower() if getattr(ctx, "args", None) else ""
-    if not uname:
-        cfg = _ig_load_cfg()
-        cur = cfg.get("watch")
+    if not IG_COMMENT_TOKEN or not IG_COMMENT_ID:
         await update.message.reply_text(
-            ("Зараз стежу за: @" + cur if cur else "Зараз не стежу за жодним акаунтом.")
-            + "\nЩоб увімкнути: /igwatch username\nЩоб вимкнути: /igwatchoff")
+            "Instagram для коментарів ще не підключений. Потрібні IG_COMMENT_TOKEN та "
+            "IG_COMMENT_ID у .env на сервері (системний токен із Meta).")
         return
+    acc = ("@" + IG_COMMENT_USERNAME) if IG_COMMENT_USERNAME else f"акаунтом {IG_COMMENT_ID}"
     cfg = _ig_load_cfg()
-    cfg["watch"] = uname
+    cfg["watch"] = IG_COMMENT_USERNAME or IG_COMMENT_ID
     cfg["since"] = time.time()
     _ig_save_cfg(cfg)
     await update.message.reply_text(
-        f"Готово. Стежу за коментарями @{uname}. Реагую на кодові слова з /igkeys "
-        "у коментарях під останніми 3 постами. Старі коментарі не чіпаю.")
+        f"Готово. Стежу за коментарями {acc}. Реагую на кодові слова з /igkeys "
+        "у коментарях під останніми 3 постами. Старі коментарі (до цього моменту) не чіпаю.")
 
 
 async def igwatchoff_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
