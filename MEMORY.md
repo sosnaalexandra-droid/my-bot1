@@ -121,3 +121,9 @@
 - НУЖНЫ права токена: instagram_manage_comments + instagram_manage_messages (они ВХОДЯТ в use case приложения — видели на экране). Токен переполучить с этими scope.
 - РИСК: отправка DM через API строже; если заблокируют — fallback на публичный ответ (работает точно). Тестировать на одном аккаунте.
 - ОСТАЁТСЯ: 1) переполучить токен с 2 новыми scope + обновить .env; 2) deploy (git pull+restart); 3) /igwatch <аккаунт> + /igaddkey; 4) тест комментом.
+
+## 2026-11-10 — IG комментарии: системный токен (SUAT) настроен
+- Пользователь прошёл путь Business Manager: создал конфигурацию «Instagram API (единый вход)» (ID 2139754836650046), SUAT (срок действия: никогда), права instagram_basic/manage_comments/manage_messages/content_publish.
+- michael_laloux добавлен как Instagram-тестировщик (принято через instagram.com, не через приложение — в приложении вкладки Tester invites нет). IG ID michael_laloux = 17841406612471518.
+- Код: комментарии теперь используют ОТДЕЛЬНЫЙ токен IG_COMMENT_TOKEN + фиксированный IG_COMMENT_ID (не /me/accounts). Аудит остался на старом INSTAGRAM_TOKEN.
+- ОСТАЁТСЯ у пользователя: 1) добавить в /root/.env: IG_COMMENT_TOKEN=<SUAT>, IG_COMMENT_ID=17841406612471518, IG_COMMENT_USERNAME=michael_laloux; 2) deploy+restart; 3) /igaddkey + /igwatch; 4) тест комментом. DM через API всё ещё может упереться в ограничения — тогда fallback на публичный ответ.
