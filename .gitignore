@@ -2,6 +2,9 @@
 .env
 .relay_state
 __pycache__/
+ig_config.json
+ig_rules.json
+ig_seen.json
 keywords.json
 notes/
 reminders/

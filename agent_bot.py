@@ -411,6 +411,162 @@ def tool_ig_competitor(username: str) -> str:
         return f"Помилка Instagram API (competitor): {e}"
 
 
+# ===================== Автовідповідь на коментарі Instagram =====================
+IG_RULES_FILE = os.path.join(HERE, "ig_rules.json")    # {кодове слово: {"dm":..., "reply":...}}
+IG_CFG_FILE = os.path.join(HERE, "ig_config.json")     # {"watch": username, "since": epoch}
+IG_SEEN_FILE = os.path.join(HERE, "ig_seen.json")      # оброблені comment_id
+
+
+def _ig_load_rules() -> dict:
+    try:
+        if os.path.exists(IG_RULES_FILE):
+            with open(IG_RULES_FILE, encoding="utf-8") as f:
+                r = json.load(f)
+                return r if isinstance(r, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _ig_save_rules(d: dict):
+    with open(IG_RULES_FILE, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+
+
+def _ig_load_cfg() -> dict:
+    try:
+        if os.path.exists(IG_CFG_FILE):
+            with open(IG_CFG_FILE, encoding="utf-8") as f:
+                c = json.load(f)
+                return c if isinstance(c, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _ig_save_cfg(c: dict):
+    with open(IG_CFG_FILE, "w", encoding="utf-8") as f:
+        json.dump(c, f, ensure_ascii=False, indent=2)
+
+
+def _ig_load_seen() -> set:
+    try:
+        if os.path.exists(IG_SEEN_FILE):
+            with open(IG_SEEN_FILE, encoding="utf-8") as f:
+                return set(json.load(f))
+    except Exception:
+        pass
+    return set()
+
+
+def _ig_save_seen(s):
+    with open(IG_SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(s)[-1000:], f, ensure_ascii=False)
+
+
+def _ig_post(path: str, data: dict = None, json_body: dict = None) -> dict:
+    params = {"access_token": IG_TOKEN}
+    url = f"{IG_BASE}/{path}"
+    if json_body is not None:
+        r = httpx.post(url, params=params, json=json_body, timeout=25)
+    else:
+        r = httpx.post(url, params=params, data=data or {}, timeout=25)
+    d = r.json() if r.content else {}
+    if r.status_code >= 400 or (isinstance(d, dict) and "error" in d):
+        msg = d.get("error", {}).get("message", r.text) if isinstance(d, dict) else r.text
+        raise RuntimeError(msg)
+    return d
+
+
+def _ig_recent_media_ids(ig_id: str, n: int = 3) -> list:
+    d = _ig_get(f"{ig_id}/media", {"fields": "id,timestamp", "limit": n})
+    return [m["id"] for m in d.get("data", [])]
+
+
+def _ig_comments(media_id: str, n: int = 25) -> list:
+    d = _ig_get(f"{media_id}/comments", {"fields": "id,text,username,timestamp", "limit": n})
+    return d.get("data", [])
+
+
+def _parse_ig_ts(ts: str) -> float:
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S+0000"):
+        try:
+            return datetime.strptime(ts, fmt).timestamp()
+        except Exception:
+            continue
+    return 0.0
+
+
+def _ig_match_rule(text: str, rules: dict):
+    low = (text or "").lower()
+    words = set(re.split(r"[^0-9a-zA-Zа-яёіїєґ_]+", low))
+    for kw, rule in rules.items():
+        k = kw.lower().strip()
+        if not k:
+            continue
+        if (" " in k and k in low) or (k in words):
+            return rule
+    return None
+
+
+async def check_ig_comments(context: ContextTypes.DEFAULT_TYPE):
+    """Раз на кілька хвилин перевіряє коментарі під останніми постами на кодові слова."""
+    if not _ig_ready():
+        return
+    rules = _ig_load_rules()
+    cfg = _ig_load_cfg()
+    watch = (cfg.get("watch") or "").strip()
+    if not rules or not watch:
+        return
+    since = float(cfg.get("since", 0) or 0)
+    try:
+        accts = _ig_accounts()
+    except Exception:
+        return
+    target = next((a for a in accts if (a.get("username") or "").lower() == watch.lower()), None)
+    if not target:
+        return
+    ig_id = target["ig_id"]
+    seen = _ig_load_seen()
+    changed = False
+    try:
+        media_ids = _ig_recent_media_ids(ig_id, 3)
+    except Exception:
+        log.exception("IG media list failed")
+        return
+    for mid in media_ids:
+        try:
+            comments = _ig_comments(mid, 25)
+        except Exception:
+            continue
+        for c in comments:
+            cid = c.get("id")
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            changed = True
+            if _parse_ig_ts(c.get("timestamp", "")) < since:
+                continue  # старий коментар — не чіпаємо
+            rule = _ig_match_rule(c.get("text", ""), rules)
+            if not rule:
+                continue
+            dm, reply = rule.get("dm"), rule.get("reply")
+            if dm:
+                try:
+                    _ig_post(f"{ig_id}/messages",
+                             json_body={"recipient": {"comment_id": cid},
+                                        "message": {"text": dm}})
+                except Exception as e:
+                    log.warning("IG DM failed: %s", e)
+            if reply:
+                try:
+                    _ig_post(f"{cid}/replies", data={"message": reply})
+                except Exception as e:
+                    log.warning("IG public reply failed: %s", e)
+    if changed:
+        _ig_save_seen(seen)
+
+
 TOOLS = [
     {"name": "calculate",
      "description": "Точно обчислює арифметичний вираз (+,-,*,/,**,%,//).",
@@ -623,8 +779,10 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/reels тема — сценарій Reels із субтитрами\n"
         "/carousel тема — карусель по слайдах\n"
         "/plan акаунт/ніша — контент-план на тиждень\n"
-        "/addkey слово | відповідь — автовідповідь за кодовим словом (для власника)\n"
-        "/keys — список кодових слів, /delkey слово — видалити\n"
+        "/addkey слово | відповідь — автовідповідь у Telegram (для власника)\n"
+        "/keys — список, /delkey слово — видалити\n"
+        "— Instagram-коментарі (для власника): /igwatch username — стежити, "
+        "/igaddkey слово | текст у Директ | публічна відповідь, /igkeys, /igdelkey, /igwatchoff\n"
         "/reset — очистити поточний діалог"
     )
 
@@ -694,6 +852,91 @@ async def delkey_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Видалено: «{kw}»")
     else:
         await update.message.reply_text("Немає такого слова. Список: /keys")
+
+
+async def igwatch_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not OWNER_ID:
+        await update.message.reply_text("Спершу признач власника: /myid → OWNER_ID у .env → рестарт.")
+        return
+    if not _is_owner(update):
+        return
+    uname = " ".join(ctx.args).strip().lstrip("@").lower() if getattr(ctx, "args", None) else ""
+    if not uname:
+        cfg = _ig_load_cfg()
+        cur = cfg.get("watch")
+        await update.message.reply_text(
+            ("Зараз стежу за: @" + cur if cur else "Зараз не стежу за жодним акаунтом.")
+            + "\nЩоб увімкнути: /igwatch username\nЩоб вимкнути: /igwatchoff")
+        return
+    cfg = _ig_load_cfg()
+    cfg["watch"] = uname
+    cfg["since"] = time.time()
+    _ig_save_cfg(cfg)
+    await update.message.reply_text(
+        f"Готово. Стежу за коментарями @{uname}. Реагую на кодові слова з /igkeys "
+        "у коментарях під останніми 3 постами. Старі коментарі не чіпаю.")
+
+
+async def igwatchoff_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
+    cfg = _ig_load_cfg()
+    cfg.pop("watch", None)
+    _ig_save_cfg(cfg)
+    await update.message.reply_text("Зупинив стеження за коментарями.")
+
+
+async def igaddkey_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not OWNER_ID:
+        await update.message.reply_text("Спершу признач власника: /myid → OWNER_ID у .env → рестарт.")
+        return
+    if not _is_owner(update):
+        return
+    raw = update.message.text.partition(" ")[2].strip()
+    parts = [p.strip() for p in raw.split("|")]
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        await update.message.reply_text(
+            "Формат: /igaddkey кодове слово | текст у Директ | (необов'язково) публічна відповідь\n"
+            "Напр.: /igaddkey курс | Ось ваш гайд: example.com/guide 🙂 | Надіслала в особисті 💌")
+        return
+    kw = parts[0].lower()
+    rule = {"dm": parts[1]}
+    if len(parts) >= 3 and parts[2]:
+        rule["reply"] = parts[2]
+    d = _ig_load_rules()
+    d[kw] = rule
+    _ig_save_rules(d)
+    await update.message.reply_text(
+        f"Готово. На «{kw}» у коментарях бот надішле Директ"
+        + (" і відповість публічно." if rule.get("reply") else ".")
+        + f" Усього правил: {len(d)}")
+
+
+async def igkeys_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
+    d = _ig_load_rules()
+    if not d:
+        await update.message.reply_text("Правил для коментарів немає. Додай: /igaddkey слово | текст у Директ")
+        return
+    lines = []
+    for k, v in d.items():
+        lines.append(f"• «{k}» → DM: {v.get('dm','')[:50]}" +
+                     (f" | відповідь: {v.get('reply')[:30]}" if v.get("reply") else ""))
+    await update.message.reply_text("Кодові слова для коментарів Instagram:\n" + "\n".join(lines))
+
+
+async def igdelkey_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
+    kw = update.message.text.partition(" ")[2].strip().lower()
+    d = _ig_load_rules()
+    if kw in d:
+        del d[kw]
+        _ig_save_rules(d)
+        await update.message.reply_text(f"Видалено: «{kw}»")
+    else:
+        await update.message.reply_text("Немає такого слова. Список: /igkeys")
 
 
 async def _agent_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str):
@@ -854,11 +1097,18 @@ def main():
     app.add_handler(CommandHandler("addkey", addkey_cmd))
     app.add_handler(CommandHandler("keys", keys_cmd))
     app.add_handler(CommandHandler("delkey", delkey_cmd))
+    app.add_handler(CommandHandler("igwatch", igwatch_cmd))
+    app.add_handler(CommandHandler("igwatchoff", igwatchoff_cmd))
+    app.add_handler(CommandHandler("igaddkey", igaddkey_cmd))
+    app.add_handler(CommandHandler("igkeys", igkeys_cmd))
+    app.add_handler(CommandHandler("igdelkey", igdelkey_cmd))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.PHOTO, photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
     # Перевіряємо нагадування щохвилини
     app.job_queue.run_repeating(check_reminders, interval=60, first=10)
+    # Перевіряємо коментарі Instagram на кодові слова
+    app.job_queue.run_repeating(check_ig_comments, interval=120, first=25)
     log.info("Agent bot started with tools")
     app.run_polling()
 
