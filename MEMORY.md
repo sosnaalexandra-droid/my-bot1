@@ -113,3 +113,11 @@
 - Владелец задаётся через OWNER_ID в .env (= Telegram ID). Без OWNER_ID addkey/keys/delkey не работают (защита).
 - Хранилище keywords.json (в .gitignore). Матч: кодовое слово как отдельное слово в сообщении (или фраза-подстрока).
 - ОСТАЁТСЯ у пользователя: 1) /myid в боте → узнать ID; 2) добавить OWNER_ID=<id> в /root/.env; 3) deploy (git pull+restart); 4) /addkey для настройки слов.
+
+## 2026-11-10 — Instagram комментарий→Директ в своём боте (без App Review)
+- Подход: НЕ вебхуки и НЕ App Review. Бот поллит комментарии под последними 3 постами отслеживаемого аккаунта (JobQueue, каждые 120с) и реагирует на кодовые слова. Работает в dev-режиме для своих аккаунтов.
+- Инструменты API: _ig_recent_media_ids, _ig_comments, _ig_post (messages/replies). DM через POST /{ig_id}/messages recipient={comment_id} (private reply на коммент). Публичный ответ через POST /{comment_id}/replies.
+- Команды владельца: /igwatch username (вкл, ставит since=now — старые комменты не трогает), /igwatchoff, /igaddkey слово | текст_в_директ | [публичный ответ], /igkeys, /igdelkey. Файлы: ig_rules.json, ig_config.json, ig_seen.json (в .gitignore).
+- НУЖНЫ права токена: instagram_manage_comments + instagram_manage_messages (они ВХОДЯТ в use case приложения — видели на экране). Токен переполучить с этими scope.
+- РИСК: отправка DM через API строже; если заблокируют — fallback на публичный ответ (работает точно). Тестировать на одном аккаунте.
+- ОСТАЁТСЯ: 1) переполучить токен с 2 новыми scope + обновить .env; 2) deploy (git pull+restart); 3) /igwatch <аккаунт> + /igaddkey; 4) тест комментом.
